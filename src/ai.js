@@ -35,16 +35,14 @@ Objetivo (puntaje 5): ${criterioIdeal}
 // Devuelve el texto de la acción sugerida, o null si Workers AI no está
 // disponible o falla — nunca debe romper el guardado del puntaje.
 export async function sugerirAccion(env, { item, score, tipoAuditoria, sector }) {
-  if (!env.AI) { sugerirAccion.ultimoError = 'no hay binding env.AI'; return null; }
+  if (!env.AI) return null;
   try {
     const messages = buildPrompt({ item, score, tipoAuditoria, sector });
     const result = await env.AI.run(MODEL, { messages, max_tokens: 180 });
     const texto = (result && (result.response || result.result?.response) || '').trim();
-    sugerirAccion.ultimoError = texto ? null : 'respuesta vacía de Workers AI: ' + JSON.stringify(result).slice(0, 300);
     return texto || null;
   } catch (err) {
     console.error('sugerirAccion falló:', err.message);
-    sugerirAccion.ultimoError = (err && err.message) || String(err);
     return null;
   }
 }

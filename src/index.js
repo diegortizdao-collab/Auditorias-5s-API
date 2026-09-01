@@ -277,19 +277,11 @@ async function upsertPuntaje(sql, env, auditId, itemId, body) {
   const totales = await recalcPuntajeTotal(sql, auditId);
 
   let accion = null;
-  let debugIaError;
   if ([0, 1].includes(Number(body.score))) {
-    sugerirAccion.ultimoError = undefined;
     accion = await generarSugerenciaSiCorresponde(sql, env, auditId, itemId, rows[0]);
-    debugIaError = accion ? undefined : sugerirAccion.ultimoError;
   }
 
-  return json({
-    score: rows[0],
-    puntaje_total: totales.puntaje_total,
-    accion_sugerida: accion ? normalizePlanAccion(accion) : null,
-    debug_ia_error: debugIaError,
-  }, env);
+  return json({ score: rows[0], puntaje_total: totales.puntaje_total, accion_sugerida: accion ? normalizePlanAccion(accion) : null }, env);
 }
 
 // Genera (una sola vez por puntaje, ver índice único ux_plan_accion_ia_por_score)
@@ -332,7 +324,6 @@ async function generarSugerenciaSiCorresponde(sql, env, auditId, itemId, scoreRo
     return inserted[0] || null;
   } catch (err) {
     console.error('generarSugerenciaSiCorresponde falló:', err.message);
-    sugerirAccion.ultimoError = 'generarSugerenciaSiCorresponde: ' + ((err && err.message) || String(err));
     return null;
   }
 }
