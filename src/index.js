@@ -607,9 +607,9 @@ export default {
 
     const url = new URL(request.url);
     const parts = url.pathname.split('/').filter(Boolean);
-    const sql = getDb(env);
-
+    
     try {
+      const sql = getDb(env);
       if (parts[0] === 'catalogos' && request.method === 'GET') {
         return await getCatalogos(sql, env);
       }
