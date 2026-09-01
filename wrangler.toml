@@ -1,0 +1,26 @@
+name = "auditorias-5s-api"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# CORS: dominio de GitHub Pages del frontend. Ajustar al repo real una vez
+# creado, ej: "https://diegortizdao-collab.github.io"
+[vars]
+ALLOWED_ORIGIN = "https://diegortizdao-collab.github.io"
+
+# Bucket R2 para las fotos de auditoría (crear con:
+#   npx wrangler r2 bucket create auditorias-5s-fotos)
+[[r2_buckets]]
+binding = "FOTOS"
+bucket_name = "auditorias-5s-fotos"
+
+# Workers AI: genera la sugerencia de acción correctiva cuando un ítem se
+# puntúa 0 o 1. No requiere cuenta ni API key aparte — usa la misma cuenta
+# de Cloudflare, con un free tier diario generoso.
+[ai]
+binding = "AI"
+
+# La connection string de Neon (DATABASE_URL) NO va acá — se carga como
+# secreto con:
+#   npx wrangler secret put DATABASE_URL
+# Ver README.md para el paso a paso completo de deploy.
