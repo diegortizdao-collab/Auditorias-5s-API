@@ -4,7 +4,7 @@
 // qué dice el 5 ideal) es el contexto — el modelo no inventa el diagnóstico,
 // solo redacta la acción concreta para cerrar esa brecha.
 
-const MODEL = '@cf/meta/llama-3.1-8b-instruct';
+const MODEL = '@cf/meta/llama-3.1-8b-instruct-fast';
 
 const CRITERIO_POR_SCORE = { 0: 'criterio_0', 1: 'criterio_1', 3: 'criterio_3', 5: 'criterio_5' };
 
