@@ -260,6 +260,28 @@ async function updateAuditoria(sql, env, id, body) {
 }
 
 // -------------------------------------------------------------------------
+// DELETE /auditorias/:id  (borra la auditoría y limpia sus fotos de R2 —
+// puntajes y plan de acción se van solos por ON DELETE CASCADE)
+// -------------------------------------------------------------------------
+async function deleteAuditoria(sql, env, id) {
+  const existe = await sql('SELECT id FROM audits WHERE id = $1', [id]);
+  if (!existe[0]) return errorResponse('Auditoría no encontrada', env, 404);
+
+  const fotos = await sql(
+    `SELECT ap.r2_key FROM audit_photos ap
+     JOIN audit_scores sc ON sc.id = ap.audit_score_id
+     WHERE sc.audit_id = $1`,
+    [id]
+  );
+  for (const f of fotos) {
+    await env.FOTOS.delete(f.r2_key);
+  }
+
+  await sql('DELETE FROM audits WHERE id = $1', [id]);
+  return json({ ok: true }, env);
+}
+
+// -------------------------------------------------------------------------
 // PUT /auditorias/:id/puntajes/:itemId  (upsert puntaje de un ítem)
 // -------------------------------------------------------------------------
 async function upsertPuntaje(sql, env, auditId, itemId, body) {
@@ -592,7 +614,7 @@ async function getDashboard(sql, env, params) {
 // (ver /sql/README de pruebas locales) sin pasar por el runtime de Workers.
 export {
   recalcPuntajeTotal, getCatalogos, getRubrica, createAuditoria, listAuditorias,
-  getAuditoria, updateAuditoria, upsertPuntaje, subirFoto, servirFoto, borrarFoto, getDashboard,
+  getAuditoria, updateAuditoria, deleteAuditoria, upsertPuntaje, subirFoto, servirFoto, borrarFoto, getDashboard,
   listPlanAccion, createPlanAccion, updatePlanAccion, regenerarPlanAccion,
 };
 
@@ -628,6 +650,7 @@ export default {
         const id = parts[1];
         if (request.method === 'GET') return await getAuditoria(sql, env, id);
         if (request.method === 'PUT') return await updateAuditoria(sql, env, id, await request.json());
+        if (request.method === 'DELETE') return await deleteAuditoria(sql, env, id);
       }
       if (parts[0] === 'auditorias' && parts[2] === 'puntajes' && parts.length === 4) {
         const [, auditId, , itemId] = parts;
