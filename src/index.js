@@ -48,7 +48,10 @@ async function getCatalogos(sql, env) {
   const sectores = await sql('SELECT id, area_id, nombre, orden FROM sectores ORDER BY orden');
   const plantas = await sql('SELECT id, nombre, orden FROM plantas ORDER BY orden');
   const uets = await sql('SELECT id, planta_id, nombre, orden FROM uets ORDER BY orden');
-  const uetSectores = await sql('SELECT id, planta_id, nombre, orden FROM uet_sectores ORDER BY orden');
+  const grupos = await sql('SELECT id, uet_id, nombre, orden FROM uet_grupos ORDER BY orden');
+  // uet_id / grupo_id pueden venir NULL en instalaciones viejas que todavía no
+  // corrieron la migración 003 — el frontend trata ese caso como "sin UET".
+  const uetSectores = await sql('SELECT id, planta_id, uet_id, grupo_id, nombre, orden FROM uet_sectores ORDER BY orden');
 
   return json({
     areas: areas.map((a) => ({
@@ -57,7 +60,13 @@ async function getCatalogos(sql, env) {
     })),
     plantas: plantas.map((p) => ({
       ...p,
-      uets: uets.filter((u) => u.planta_id === p.id),
+      uets: uets.filter((u) => u.planta_id === p.id).map((u) => ({
+        ...u,
+        grupos: grupos.filter((g) => g.uet_id === u.id),
+      })),
+      // Se mantiene plano (todos los sectores de la planta) para no romper
+      // nada que ya lo consuma así, pero cada sector ahora trae uet_id y
+      // grupo_id para que se pueda filtrar/anidar por UET en el front.
       uet_sectores: uetSectores.filter((s) => s.planta_id === p.id),
     })),
   }, env);
@@ -515,78 +524,134 @@ async function getDashboard(sql, env, params) {
   const plantaId = params.get('planta_id');
   const uetId = params.get('uet_id');
   const uetSectorId = params.get('uet_sector_id');
-  const anio = Number(params.get('anio')) || new Date().getFullYear();
+  const anioParam = params.get('anio');
+  const mesParam = params.get('mes');
+  // 'todos' (o vacío) = sin filtrar por año/mes → promedia todo lo que
+  // matchee el resto del segmentador, sea de la fecha que sea.
+  const anio = anioParam && anioParam !== 'todos' ? Number(anioParam) : null;
+  const mes = mesParam && mesParam !== 'todos' ? Number(mesParam) : null;
 
-  const filtroBase = [`audit_type = $1`];
-  const valoresBase = [tipo];
-  let i = 2;
-  if (plantaId) { filtroBase.push(`planta_id = $${i++}`); valoresBase.push(plantaId); }
-  if (uetId) { filtroBase.push(`uet_id = $${i++}`); valoresBase.push(uetId); }
-  if (uetSectorId) { filtroBase.push(`uet_sector_id = $${i++}`); valoresBase.push(uetSectorId); }
-  const whereBase = filtroBase.join(' AND ');
-
-  // Última auditoría (para radar + tarjeta de puntaje)
-  const ultimas = await sql(
-    `SELECT * FROM audits WHERE ${whereBase} ORDER BY fecha DESC, id DESC LIMIT 2`,
-    valoresBase
-  );
-  const actual = ultimas[0] ? normalizeAudit(ultimas[0]) : null;
-  const anterior = ultimas[1] ? normalizeAudit(ultimas[1]) : null;
-
-  let radar = [];
-  if (actual) {
-    radar = await sql(
-      `SELECT rc.tag, rc.label,
-              COALESCE(SUM(sc.score), 0) AS logrado,
-              COUNT(ri.id) * 5 AS maximo
-       FROM rubric_categories rc
-       JOIN rubric_items ri ON ri.category_id = rc.id
-       LEFT JOIN audit_scores sc ON sc.rubric_item_id = ri.id AND sc.audit_id = $1
-       WHERE rc.audit_type = $2
-       GROUP BY rc.id, rc.tag, rc.label, rc.orden
-       ORDER BY rc.orden`,
-      [actual.id, tipo]
-    );
+  // Arma el filtro sobre `audits AS a` según el segmentador (tipo/planta/
+  // UET/sector, y opcionalmente año/mes). Se reusa para radar, promedio de
+  // puntaje total y los 3 comparativos — así todos reflejan exactamente lo
+  // que el segmentador tiene elegido.
+  function buildFiltro({ incluirAnioMes }) {
+    const clauses = [`a.audit_type = $1`];
+    const values = [tipo];
+    let n = 2;
+    if (plantaId) { clauses.push(`a.planta_id = $${n++}`); values.push(plantaId); }
+    if (uetId) { clauses.push(`a.uet_id = $${n++}`); values.push(uetId); }
+    if (uetSectorId) { clauses.push(`a.uet_sector_id = $${n++}`); values.push(uetSectorId); }
+    if (incluirAnioMes) {
+      if (anio) { clauses.push(`EXTRACT(YEAR FROM a.fecha) = $${n++}`); values.push(anio); }
+      if (mes) { clauses.push(`EXTRACT(MONTH FROM a.fecha) = $${n++}`); values.push(mes); }
+    }
+    return { where: clauses.join(' AND '), values, next: n };
   }
 
+  const { where: whereBase, values: valoresBase, next: nBase } = buildFiltro({ incluirAnioMes: true });
+
+  // Años con auditorías cargadas para este tipo (para poblar el selector de
+  // Año) — no depende del resto del segmentador, solo del tipo.
+  const aniosRows = await sql(
+    `SELECT DISTINCT EXTRACT(YEAR FROM fecha)::int AS anio FROM audits WHERE audit_type = $1 ORDER BY anio DESC`,
+    [tipo]
+  );
+  const aniosDisponibles = aniosRows.map((r) => r.anio);
+
+  // Radar 5S: PROMEDIO de % logrado por categoría entre todas las
+  // auditorías que matchean el segmentador actual (no solo la última).
+  const radarRows = await sql(
+    `WITH auditorias_f AS (SELECT a.id FROM audits a WHERE ${whereBase}),
+          por_categoria AS (
+            SELECT af.id AS audit_id, rc.id AS cat_id, rc.tag, rc.label, rc.orden,
+                   COALESCE(SUM(sc.score), 0) AS logrado,
+                   COUNT(ri.id) * 5 AS maximo
+            FROM auditorias_f af
+            JOIN rubric_categories rc ON rc.audit_type = $${nBase}
+            JOIN rubric_items ri ON ri.category_id = rc.id
+            LEFT JOIN audit_scores sc ON sc.rubric_item_id = ri.id AND sc.audit_id = af.id
+            GROUP BY af.id, rc.id, rc.tag, rc.label, rc.orden
+          )
+     SELECT tag, label, orden, AVG(CASE WHEN maximo > 0 THEN 100.0 * logrado / maximo END) AS pct
+     FROM por_categoria GROUP BY tag, label, orden ORDER BY orden`,
+    [...valoresBase, tipo]
+  );
+
+  // Puntaje total: PROMEDIO entre todas las auditorías que matchean el
+  // segmentador, más cuántas se promediaron y el rango de fechas cubierto.
+  const resumenRows = await sql(
+    `SELECT COUNT(*) AS n, AVG(a.puntaje_total) AS promedio, MIN(a.fecha) AS desde, MAX(a.fecha) AS hasta
+     FROM audits a WHERE ${whereBase}`,
+    valoresBase
+  );
+  const resumen = resumenRows[0] || {};
+  const totalAuditorias = Number(resumen.n || 0);
+
+  // Última auditoría individual del segmentador — solo como dato de
+  // contexto (quién la hizo y cuándo), no participa del promedio de arriba.
+  const ultimaRows = await sql(
+    `SELECT a.* FROM audits a WHERE ${whereBase} ORDER BY a.fecha DESC, a.id DESC LIMIT 1`,
+    valoresBase
+  );
+  const ultima = ultimaRows[0] ? normalizeAudit(ultimaRows[0]) : null;
+
+  // Evolución mensual (Objetivo vs. Auditado): necesita un año puntual para
+  // el eje de 12 meses. Si el segmentador ya eligió un año, se usa ese; si
+  // eligió "Todos", se toma el año más reciente con datos para el resto del
+  // segmentador (planta/UET/sector), sin importar el filtro de mes.
+  let anioEvolucion = anio;
+  if (!anioEvolucion) {
+    const { where: whereSinFecha, values: valoresSinFecha } = buildFiltro({ incluirAnioMes: false });
+    const rec = await sql(`SELECT MAX(EXTRACT(YEAR FROM a.fecha))::int AS anio FROM audits a WHERE ${whereSinFecha}`, valoresSinFecha);
+    anioEvolucion = rec[0]?.anio || new Date().getFullYear();
+  }
+  const { where: whereEvol, values: valoresEvolBase, next: nEvol } = buildFiltro({ incluirAnioMes: false });
   const objetivos = await sql(
     'SELECT mes, objetivo FROM monthly_targets WHERE audit_type = $1 AND anio = $2 ORDER BY mes',
-    [tipo, anio]
+    [tipo, anioEvolucion]
   );
   const promedios = await sql(
-    `SELECT EXTRACT(MONTH FROM fecha)::int AS mes, AVG(puntaje_total) AS auditado
-     FROM audits
-     WHERE ${whereBase} AND EXTRACT(YEAR FROM fecha) = $${i}
+    `SELECT EXTRACT(MONTH FROM a.fecha)::int AS mes, AVG(a.puntaje_total) AS auditado
+     FROM audits a WHERE ${whereEvol} AND EXTRACT(YEAR FROM a.fecha) = $${nEvol}
      GROUP BY mes`,
-    [...valoresBase, anio]
+    [...valoresEvolBase, anioEvolucion]
   );
   const evolucion = Array.from({ length: 12 }, (_, idx) => {
-    const mes = idx + 1;
-    const obj = objetivos.find((o) => o.mes === mes);
-    const prom = promedios.find((p) => p.mes === mes);
+    const m = idx + 1;
+    const obj = objetivos.find((o) => o.mes === m);
+    const prom = promedios.find((p) => p.mes === m);
     return {
-      mes,
+      mes: m,
       objetivo: obj ? Number(obj.objetivo) : null,
       auditado: prom ? Number(prom.auditado) : null,
     };
   });
 
-  let comparativo = [];
-  if (tipo === 'planta') {
-    const filtroComp = [`a.audit_type = $1`];
-    const valoresComp = [tipo];
-    let j = 2;
-    if (plantaId) { filtroComp.push(`a.planta_id = $${j++}`); valoresComp.push(plantaId); }
-    if (uetId) { filtroComp.push(`a.uet_id = $${j++}`); valoresComp.push(uetId); }
-    comparativo = await sql(
-      `SELECT DISTINCT ON (a.uet_sector_id) us.nombre AS sector, a.puntaje_total, a.fecha
-       FROM audits a
-       JOIN uet_sectores us ON us.id = a.uet_sector_id
-       WHERE ${filtroComp.join(' AND ')} AND a.uet_sector_id IS NOT NULL
-       ORDER BY a.uet_sector_id, a.fecha DESC, a.id DESC`,
-      valoresComp
+  // Comparativos (solo tipo "planta"): PROMEDIO de puntaje total agrupado
+  // por sector / UET / planta, entre las auditorías que matchean el
+  // segmentador actual.
+  async function comparativoPor(campo, tabla, alias) {
+    return sql(
+      `SELECT t.id, t.nombre AS label, t.orden, AVG(a.puntaje_total) AS puntaje, COUNT(*) AS n
+       FROM audits a JOIN ${tabla} t ON t.id = a.${campo}
+       WHERE ${whereBase} AND a.${campo} IS NOT NULL
+       GROUP BY t.id, t.nombre, t.orden
+       ORDER BY t.orden`,
+      valoresBase
     );
   }
+  let comparativoSector = [];
+  let comparativoUet = [];
+  let comparativoPlanta = [];
+  if (tipo === 'planta') {
+    [comparativoSector, comparativoUet, comparativoPlanta] = await Promise.all([
+      comparativoPor('uet_sector_id', 'uet_sectores', 'us'),
+      comparativoPor('uet_id', 'uets', 'u'),
+      comparativoPor('planta_id', 'plantas', 'p'),
+    ]);
+  }
+  const mapComparativo = (rows) => rows.map((r) => ({ label: r.label, puntaje: Number(r.puntaje), n: Number(r.n) }));
 
   const mesActual = new Date().getMonth() + 1;
   const objetivoMesActual = objetivos.find((o) => o.mes === mesActual);
@@ -594,17 +659,22 @@ async function getDashboard(sql, env, params) {
   return json({
     audit_type: tipo,
     anio,
-    radar: radar.map((r) => ({ tag: r.tag, label: r.label, pct: r.maximo ? Math.round((r.logrado / r.maximo) * 100) : null })),
-    puntaje: actual ? {
-      actual: Number(actual.puntaje_total),
-      fecha: actual.fecha,
+    mes,
+    anios_disponibles: aniosDisponibles,
+    anio_evolucion: anioEvolucion,
+    radar: radarRows.map((r) => ({ tag: r.tag, label: r.label, pct: r.pct !== null && r.pct !== undefined ? Math.round(Number(r.pct)) : null })),
+    puntaje: totalAuditorias ? {
+      promedio: Number(resumen.promedio),
+      n: totalAuditorias,
+      desde: normalizeAudit({ fecha: resumen.desde }).fecha,
+      hasta: normalizeAudit({ fecha: resumen.hasta }).fecha,
       objetivo_mes_actual: objetivoMesActual ? Number(objetivoMesActual.objetivo) : null,
-      anterior: anterior ? Number(anterior.puntaje_total) : null,
-      variacion: anterior ? Number(actual.puntaje_total) - Number(anterior.puntaje_total) : null,
-      responsable: actual.responsable,
+      ultima: ultima ? { fecha: ultima.fecha, puntaje: Number(ultima.puntaje_total), responsable: ultima.responsable } : null,
     } : null,
     evolucion,
-    comparativo: comparativo.map((c) => ({ sector: c.sector, puntaje: Number(c.puntaje_total), fecha: normalizeAudit({ fecha: c.fecha }).fecha })),
+    comparativo: mapComparativo(comparativoSector),
+    comparativo_uet: mapComparativo(comparativoUet),
+    comparativo_planta: mapComparativo(comparativoPlanta),
     objetivo_mes_actual: objetivoMesActual ? Number(objetivoMesActual.objetivo) : null,
   }, env);
 }

@@ -84,17 +84,55 @@ con cuidado o crear un segundo proyecto/branch de Neon para pruebas.
 - `sql/002_plan_accion.sql` — migración idempotente para sumar `plan_accion`
   a una base que ya corrió `schema.sql` antes de que existiera esta
   funcionalidad. Si arrancás de cero con `schema.sql`, no hace falta correrla.
+- `sql/003_estructura_real_uet.sql` — migración idempotente que corrige la
+  jerarquía real Planta → UET → (Grupo opcional) → Sector, reubica los
+  sectores que estaban en la planta equivocada y reasigna las auditorías ya
+  cargadas para que queden consistentes con el catálogo corregido. Ver
+  "Estructura Planta / UET / Sector" más abajo. Si arrancás de cero, corré
+  igual `schema.sql` → `seed.sql` → `002_plan_accion.sql` → esta, en ese
+  orden (el seed sigue trayendo la estructura vieja; esta migración es la
+  que la deja bien).
 - `sql/seed.sql` — áreas/sectores/plantas/UET/rúbricas S1-S5 (Planta, Pañol,
   Oficina) y objetivos mensuales 2026 de Planta (30 en enero → 75 en
   diciembre, lineal). Generado automáticamente desde los mismos datos ya
   usados en el preview de diseño — ver `gen_seed_sql.py` si hace falta
   regenerarlo tras un cambio de rúbrica.
 
+## Estructura Planta / UET / Sector
+
+Escorial tiene 2 plantas, cada una con sus UET, y cada UET con sus sectores
+físicos (algunos sectores cuelgan directo de la UET, otros están agrupados
+bajo un "grupo" intermedio dentro de esa UET — Soldadura en UET 4, Pintura y
+Prensa en UET 5 de Suipacha):
+
+```
+Suipacha
+  UET 4: Armado Gas · Armado Eléctrico · Calefones
+         Soldadura: Soldadura Línea 1 · Soldadura Línea 2 · Gema
+  UET 5: Pintura: Cabina de Pintura · Horno de Pirólisis · Armado de Camisas
+         Prensa: LC06/Láser · Prensas y Omera · Circuito de manijas · EP04
+  Matricería Suipacha (sector homónimo, sin sub-sectores por ahora)
+  Mantenimiento Suipacha: Taller · Pañol
+
+25 de Mayo
+  UET 1: Línea 1 Cocinas · Línea 2 Cocinas · Línea 3 Cocinas · Prearmado
+  UET 2: Welding · Enlozado · Gema
+  UET 3: Corte · Estampado
+  Matricería 25 de Mayo (sector homónimo, sin sub-sectores por ahora)
+  Mantenimiento 25 de Mayo: Taller · Pañol
+```
+
+Esto vive en 3 tablas: `plantas` → `uets` (`planta_id`) → `uet_grupos`
+(`uet_id`, opcional) → `uet_sectores` (`uet_id` + `grupo_id` opcional +
+`planta_id` denormalizado). El `grupo_id` es puramente organizativo — el
+sector sigue siendo la unidad que se audita (para poder controlar mejor las
+acciones correctivas cuando la UET es grande), no se audita a nivel grupo.
+
 ## Endpoints
 
 | Método | Ruta | Uso |
 |---|---|---|
-| GET | `/catalogos` | áreas/sectores, plantas/UET/sectores |
+| GET | `/catalogos` | áreas/sectores, plantas → UET (con sus grupos) → sectores |
 | GET | `/rubrica/:tipo` | rúbrica S1-S5 de `planta`/`panol`/`oficina` |
 | GET | `/auditorias` | listado (filtros: tipo, planta_id, uet_id, uet_sector_id, area_id, sector_id, estado, desde, hasta, limit) |
 | POST | `/auditorias` | crea auditoría |
@@ -104,7 +142,7 @@ con cuidado o crear un segundo proyecto/branch de Neon para pruebas.
 | POST | `/auditorias/:id/puntajes/:itemId/fotos` | sube una foto (binario) |
 | GET | `/fotos/:key` | sirve una foto desde R2 |
 | DELETE | `/fotos/:id` | borra una foto |
-| GET | `/dashboard` | radar, evolución, comparativo (filtros: tipo, planta_id, uet_id, uet_sector_id, anio) |
+| GET | `/dashboard` | radar (promedio de % por categoría), puntaje total (promedio), evolución mensual y comparativo por sector/UET/planta (todo como PROMEDIO de las auditorías que matchean el segmentador). Filtros: tipo, planta_id, uet_id, uet_sector_id, `anio` (año puntual, o se omite / `todos` para promediar todos los años), `mes` (1-12, o se omite / `todos` para todos los meses) |
 | GET | `/plan-accion` | lista acciones (IA + manuales) de todas las auditorías (filtros: estado, `pendientes=1` [abierta + en_proceso, todo lo no cerrado], audit_type, planta_id, uet_sector_id, area_id, sector_id, audit_id, `exclude_audit_id`, limit) |
 | POST | `/plan-accion` | crea una acción manual (`audit_id` + `descripcion` requeridos; opcionales: `rubric_item_id`, `audit_score_id`, `responsable`, `fecha_compromiso`) |
 | PUT | `/plan-accion/:id` | actualiza una acción (descripcion, responsable, fecha_compromiso, fecha_cierre, estado: `abierta`/`en_proceso`/`cerrada`) |
