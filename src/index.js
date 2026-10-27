@@ -5,6 +5,9 @@ import { sugerirAccion } from './ai.js';
 const HEADER_FIELDS = [
   'area_id', 'sector_id', 'planta_id', 'uet_id', 'uet_sector_id',
   'fecha', 'turno', 'evaluador', 'supervisor_lider', 'jefe_gerente', 'responsable',
+  // Encabezado manual de auditorías de competencia (ver createAuditoria) —
+  // se pueden corregir después igual que cualquier otro campo del encabezado.
+  'comp_planta', 'comp_uet', 'comp_sector', 'comp_subsector',
 ];
 
 // Algunos drivers de Postgres (ej. node-postgres/pg, usado en desarrollo
@@ -111,6 +114,22 @@ async function createAuditoria(sql, env, body) {
     return errorResponse('fecha y evaluador son requeridos', env);
   }
 
+  // Auditoría de competencia (competencia anual entre sectores/subsectores):
+  // misma rúbrica/puntaje que una auditoría normal del mismo audit_type, pero
+  // el encabezado de ubicación se completa a mano porque incluye subsectores
+  // que el catálogo general no tiene cargados. Los campos de catálogo quedan
+  // en NULL (aunque vinieran en el body) para que nunca termine mezclada con
+  // la estructura real de plantas/UET/sectores.
+  const esCompetencia = body.es_competencia === true || body.es_competencia === 1;
+  if (esCompetencia) {
+    if (!body.comp_planta || !body.comp_uet || !body.comp_sector || !body.comp_subsector) {
+      return errorResponse(
+        'En una auditoría de competencia, planta, UET, sector y subsector son requeridos',
+        env
+      );
+    }
+  }
+
   const { anio, mes } = anioMesDeFecha(body.fecha);
   const objetivoRows = await sql(
     'SELECT objetivo FROM monthly_targets WHERE audit_type = $1 AND anio = $2 AND mes = $3',
@@ -122,15 +141,25 @@ async function createAuditoria(sql, env, body) {
     `INSERT INTO audits
        (audit_type, area_id, sector_id, planta_id, uet_id, uet_sector_id,
         fecha, turno, evaluador, supervisor_lider, jefe_gerente,
-        puntaje_objetivo, responsable, puntaje_total, estado)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'en_progreso')
+        puntaje_objetivo, responsable, puntaje_total, estado,
+        es_competencia, comp_planta, comp_uet, comp_sector, comp_subsector)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'en_progreso',$14,$15,$16,$17,$18)
      RETURNING *`,
     [
-      body.audit_type, body.area_id || null, body.sector_id || null,
-      body.planta_id || null, body.uet_id || null, body.uet_sector_id || null,
+      body.audit_type,
+      esCompetencia ? null : body.area_id || null,
+      esCompetencia ? null : body.sector_id || null,
+      esCompetencia ? null : body.planta_id || null,
+      esCompetencia ? null : body.uet_id || null,
+      esCompetencia ? null : body.uet_sector_id || null,
       body.fecha, body.turno || null, body.evaluador,
       body.supervisor_lider || null, body.jefe_gerente || null,
       puntajeObjetivo, body.responsable || body.evaluador,
+      esCompetencia,
+      esCompetencia ? body.comp_planta : null,
+      esCompetencia ? body.comp_uet : null,
+      esCompetencia ? body.comp_sector : null,
+      esCompetencia ? body.comp_subsector : null,
     ]
   );
   return json(normalizeAudit(rows[0]), env, { status: 201 });
@@ -158,13 +187,19 @@ async function listAuditorias(sql, env, params) {
     where.push(`fecha <= $${i++}`);
     values.push(params.get('hasta'));
   }
+  // Las auditorías de competencia son "aparte de lo habitual": por defecto
+  // quedan afuera de este listado (Selección / Historial / Plan de Acción),
+  // y solo aparecen si se pide explícitamente con competencia=1.
+  where.push(`es_competencia = $${i++}`);
+  values.push(params.get('competencia') === '1');
 
   const limit = Math.min(Number(params.get('limit')) || 100, 500);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
   const rows = await sql(
     `SELECT id, audit_type, fecha, evaluador, planta_id, uet_id, uet_sector_id,
-            area_id, sector_id, puntaje_total, puntaje_objetivo, estado, created_at
+            area_id, sector_id, puntaje_total, puntaje_objetivo, estado, created_at,
+            es_competencia, comp_planta, comp_uet, comp_sector, comp_subsector
      FROM audits
      ${whereSql}
      ORDER BY fecha DESC, id DESC
@@ -536,7 +571,9 @@ async function getDashboard(sql, env, params) {
   // puntaje total y los 3 comparativos — así todos reflejan exactamente lo
   // que el segmentador tiene elegido.
   function buildFiltro({ incluirAnioMes }) {
-    const clauses = [`a.audit_type = $1`];
+    // Las auditorías de competencia tienen su propia pantalla de indicadores
+    // (GET /competencia) y nunca deben mezclarse con el promedio "habitual".
+    const clauses = [`a.audit_type = $1`, `a.es_competencia = false`];
     const values = [tipo];
     let n = 2;
     if (plantaId) { clauses.push(`a.planta_id = $${n++}`); values.push(plantaId); }
@@ -554,7 +591,8 @@ async function getDashboard(sql, env, params) {
   // Años con auditorías cargadas para este tipo (para poblar el selector de
   // Año) — no depende del resto del segmentador, solo del tipo.
   const aniosRows = await sql(
-    `SELECT DISTINCT EXTRACT(YEAR FROM fecha)::int AS anio FROM audits WHERE audit_type = $1 ORDER BY anio DESC`,
+    `SELECT DISTINCT EXTRACT(YEAR FROM fecha)::int AS anio FROM audits
+     WHERE audit_type = $1 AND es_competencia = false ORDER BY anio DESC`,
     [tipo]
   );
   const aniosDisponibles = aniosRows.map((r) => r.anio);
@@ -679,12 +717,98 @@ async function getDashboard(sql, env, params) {
   }, env);
 }
 
+// -------------------------------------------------------------------------
+// GET /competencia  (indicadores de la competencia anual — radar +
+// comparativo por subsector, totalmente aparte del Dashboard habitual)
+// -------------------------------------------------------------------------
+async function getCompetenciaIndicadores(sql, env, params) {
+  const tipo = params.get('tipo') || 'planta';
+  const anioParam = params.get('anio');
+  const subsector = params.get('subsector');
+  const anio = anioParam && anioParam !== 'todos' ? Number(anioParam) : null;
+
+  const clauses = [`a.audit_type = $1`, `a.es_competencia = true`];
+  const values = [tipo];
+  let n = 2;
+  if (anio) { clauses.push(`EXTRACT(YEAR FROM a.fecha) = $${n++}`); values.push(anio); }
+  if (subsector) { clauses.push(`a.comp_subsector = $${n++}`); values.push(subsector); }
+  const where = clauses.join(' AND ');
+
+  // Años y subsectores disponibles para poblar el segmentador — solo
+  // dependen del tipo (no del resto del segmentador ya elegido).
+  const aniosRows = await sql(
+    `SELECT DISTINCT EXTRACT(YEAR FROM fecha)::int AS anio FROM audits
+     WHERE audit_type = $1 AND es_competencia = true ORDER BY anio DESC`,
+    [tipo]
+  );
+  const subsectoresRows = await sql(
+    `SELECT DISTINCT comp_subsector FROM audits
+     WHERE audit_type = $1 AND es_competencia = true AND comp_subsector IS NOT NULL
+     ORDER BY comp_subsector`,
+    [tipo]
+  );
+
+  // Radar 5S: PROMEDIO de % logrado por categoría (misma rúbrica que la
+  // auditoría normal del mismo audit_type), entre las auditorías de
+  // competencia que matchean el segmentador.
+  const radarRows = await sql(
+    `WITH auditorias_f AS (SELECT a.id FROM audits a WHERE ${where}),
+          por_categoria AS (
+            SELECT af.id AS audit_id, rc.id AS cat_id, rc.tag, rc.label, rc.orden,
+                   COALESCE(SUM(sc.score), 0) AS logrado,
+                   COUNT(ri.id) * 5 AS maximo
+            FROM auditorias_f af
+            JOIN rubric_categories rc ON rc.audit_type = $${n}
+            JOIN rubric_items ri ON ri.category_id = rc.id
+            LEFT JOIN audit_scores sc ON sc.rubric_item_id = ri.id AND sc.audit_id = af.id
+            GROUP BY af.id, rc.id, rc.tag, rc.label, rc.orden
+          )
+     SELECT tag, label, orden, AVG(CASE WHEN maximo > 0 THEN 100.0 * logrado / maximo END) AS pct
+     FROM por_categoria GROUP BY tag, label, orden ORDER BY orden`,
+    [...values, tipo]
+  );
+
+  const resumenRows = await sql(
+    `SELECT COUNT(*) AS n, AVG(a.puntaje_total) AS promedio, MIN(a.fecha) AS desde, MAX(a.fecha) AS hasta
+     FROM audits a WHERE ${where}`,
+    values
+  );
+  const resumen = resumenRows[0] || {};
+  const totalAuditorias = Number(resumen.n || 0);
+
+  // Comparativo por subsector: promedio de puntaje_total de cada subsector
+  // que participa de la competencia (el gráfico de barras del imprimible).
+  const comparativoRows = await sql(
+    `SELECT a.comp_subsector AS label, AVG(a.puntaje_total) AS puntaje, COUNT(*) AS n
+     FROM audits a WHERE ${where} AND a.comp_subsector IS NOT NULL
+     GROUP BY a.comp_subsector ORDER BY a.comp_subsector`,
+    values
+  );
+
+  return json({
+    audit_type: tipo,
+    anio,
+    subsector,
+    anios_disponibles: aniosRows.map((r) => r.anio),
+    subsectores_disponibles: subsectoresRows.map((r) => r.comp_subsector),
+    radar: radarRows.map((r) => ({ tag: r.tag, label: r.label, pct: r.pct !== null && r.pct !== undefined ? Math.round(Number(r.pct)) : null })),
+    puntaje: totalAuditorias ? {
+      promedio: Number(resumen.promedio),
+      n: totalAuditorias,
+      desde: normalizeAudit({ fecha: resumen.desde }).fecha,
+      hasta: normalizeAudit({ fecha: resumen.hasta }).fecha,
+    } : null,
+    comparativo_subsector: comparativoRows.map((r) => ({ label: r.label, puntaje: Number(r.puntaje), n: Number(r.n) })),
+  }, env);
+}
+
 // Exportadas también con nombre para poder testear la lógica de negocio
 // (queries SQL, recálculos) desde Node con un adaptador `sql` distinto
 // (ver /sql/README de pruebas locales) sin pasar por el runtime de Workers.
 export {
   recalcPuntajeTotal, getCatalogos, getRubrica, createAuditoria, listAuditorias,
   getAuditoria, updateAuditoria, deleteAuditoria, upsertPuntaje, subirFoto, servirFoto, borrarFoto, getDashboard,
+  getCompetenciaIndicadores,
   listPlanAccion, createPlanAccion, updatePlanAccion, regenerarPlanAccion,
 };
 
@@ -711,6 +835,9 @@ export default {
       }
       if (parts[0] === 'dashboard' && request.method === 'GET') {
         return await getDashboard(sql, env, url.searchParams);
+      }
+      if (parts[0] === 'competencia' && request.method === 'GET') {
+        return await getCompetenciaIndicadores(sql, env, url.searchParams);
       }
       if (parts[0] === 'auditorias' && parts.length === 1) {
         if (request.method === 'GET') return await listAuditorias(sql, env, url.searchParams);
